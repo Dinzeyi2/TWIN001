@@ -506,7 +506,7 @@ def records_to_df(
     for col in cat_cols:
         orig_classes = list(encoders[col].classes_) if col in encoders else []
         new_classes  = list(new_string_vals.get(col, set()))
-        all_classes  = sorted(set(orig_classes) | set(new_classes))
+        all_classes  = sorted({str(v) for v in set(orig_classes) | set(new_classes)})
         le = LabelEncoder()
         le.fit(all_classes)
         extended_encoders[col] = le
