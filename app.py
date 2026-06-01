@@ -19,7 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI()
+app = FastAPI(title="Codeastra Decision Fidelity Benchmark", version="1.0")
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -546,29 +550,40 @@ def read_file(contents: bytes, filename: str) -> pd.DataFrame:
 
 
 def prepare(df: pd.DataFrame):
-    """Auto-detect target (last column), encode, return X, y."""
+    """
+    Auto-detect target (last column), encode categoricals, return X, y, target.
+    Also returns col_types so twin_df knows which fields were categorical.
+    """
     target = df.columns[-1]
     df     = df.copy().dropna(subset=[target])
 
+    # Encode categorical features
+    col_encoders = {}
     for col in df.select_dtypes(include=["object","category","bool"]).columns:
         if col != target:
-            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+            col_encoders[col] = le
 
+    # Encode target
     y_raw = df[target]
-    if y_raw.dtype == object or str(y_raw.dtype) in ("category","string"):
-        classes  = sorted(y_raw.astype(str).unique())
+    if y_raw.dtype == object or str(y_raw.dtype) in ("category","string","bool"):
+        classes = sorted(y_raw.astype(str).unique())
         y = (y_raw.astype(str) == classes[-1]).astype(int)
-    elif y_raw.nunique() <= 10:
-        y = y_raw.astype(int)
-        # binarize if multi-class
-        if y.max() > 1:
-            y = (y > 0).astype(int)
     else:
-        y = (y_raw > y_raw.median()).astype(int)
+        try:
+            y_num = pd.to_numeric(y_raw, errors="raise")
+            if y_num.nunique() <= 10:
+                y = (y_num > 0).astype(int) if y_num.max() > 1 else y_num.astype(int)
+            else:
+                y = (y_num > y_num.median()).astype(int)
+        except Exception:
+            classes = sorted(y_raw.astype(str).unique())
+            y = (y_raw.astype(str) == classes[-1]).astype(int)
 
     X = df.drop(columns=[target]).select_dtypes(include="number").astype(float)
     X = X.fillna(X.median())
-    return X, y, target
+    return X, y, target, col_encoders
 
 
 def call_api(records: list, api_key: str) -> list:
@@ -597,8 +612,11 @@ def call_api(records: list, api_key: str) -> list:
 
 def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
     """
-    Twin every row via the Codeastra API. No fallbacks.
-    If the API fails or returns an unparseable value, we raise — never silently use real data.
+    Twin every row via the Codeastra API.
+
+    The API twins identity/categorical fields as strings (e.g. occupation → "Project Manager")
+    and numeric fields as numbers. Both are valid twins — we hash-encode strings back
+    to stable integers so sklearn can use them. Real values are never substituted.
     """
     cols    = list(df.columns)
     col_map = {c: c.replace(" ","_").replace("-","_").lower() for c in cols}
@@ -613,6 +631,23 @@ def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
                 f"for {len(records[i:i+BATCH_SIZE])} records.")
         twins.extend(batch_twins)
 
+    # Build stable hash-encoders for any field the API returns as strings
+    string_vals: dict[str, set] = {}
+    for rec in twins:
+        for orig, clean in col_map.items():
+            val = rec.get(clean)
+            if val is not None:
+                try:
+                    float(str(val).replace(",","").replace("$","").strip())
+                except (ValueError, TypeError):
+                    string_vals.setdefault(orig, set()).add(str(val))
+
+    # Assign stable integer codes to each unique string value per field
+    string_codes: dict[str, dict] = {
+        field: {v: idx for idx, v in enumerate(sorted(vals))}
+        for field, vals in string_vals.items()
+    }
+
     rows = []
     for i, rec in enumerate(twins):
         row = {}
@@ -621,12 +656,12 @@ def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
             if val is None:
                 raise HTTPException(502,
                     f"Codeastra API did not return field '{orig}' in twin record {i}.")
+            val_str = str(val).replace(",","").replace("$","").strip()
             try:
-                parsed = float(str(val).replace(",","").replace("$","").strip())
+                parsed = float(val_str)
             except (ValueError, TypeError):
-                raise HTTPException(502,
-                    f"Codeastra API returned non-numeric value '{val}' "
-                    f"for numeric field '{orig}'.")
+                # API twinned this as a string (categorical field) — encode to int
+                parsed = float(string_codes[orig].get(str(val), 0))
             if math.isnan(parsed):
                 raise HTTPException(502,
                     f"Codeastra API returned NaN for field '{orig}'.")
@@ -650,6 +685,11 @@ async def benchmark(
 ):
     contents = await file.read()
 
+    # Validate API key format first — before any other check
+    key = api_key.strip()
+    if not key or len(key) < 20:
+        raise HTTPException(401, "Invalid API key. Check your Codeastra API key.")
+
     try:
         df = read_file(contents, file.filename)
     except Exception as e:
@@ -659,7 +699,7 @@ async def benchmark(
         raise HTTPException(400, "Need at least 50 rows.")
 
     try:
-        X, y, target = prepare(df)
+        X, y, target, col_encoders = prepare(df)
     except Exception as e:
         raise HTTPException(400, f"Data preparation failed: {e}")
 
@@ -673,7 +713,7 @@ async def benchmark(
 
     # Twin training set
     try:
-        X_tw = twin_df(X_tr, api_key.strip())
+        X_tw = twin_df(X_tr, key)
     except HTTPException:
         raise
     except Exception as e:
