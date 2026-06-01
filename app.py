@@ -398,11 +398,20 @@ def read_file(contents: bytes, filename: str) -> pd.DataFrame:
 
 
 def prepare(df: pd.DataFrame):
+    """
+    Returns:
+      X_raw       — DataFrame with original values (categoricals kept as strings)
+                    → this is what gets sent to the Codeastra API
+      X_encoded   — same but fully numeric → used for ML training
+      y           — binary target
+      target      — target column name
+      cat_cols    — list of categorical column names
+      encoders    — LabelEncoder per categorical column
+    """
     target = df.columns[-1]
     df     = df.copy().dropna(subset=[target])
-    for col in df.select_dtypes(include=["object","category","bool"]).columns:
-        if col != target:
-            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+
+    # Encode target
     y_raw = df[target]
     if y_raw.dtype == object or str(y_raw.dtype) in ("category","string","bool"):
         classes = sorted(y_raw.astype(str).unique())
@@ -414,9 +423,27 @@ def prepare(df: pd.DataFrame):
         except Exception:
             classes = sorted(y_raw.astype(str).unique())
             y = (y_raw.astype(str) == classes[-1]).astype(int)
-    X = df.drop(columns=[target]).select_dtypes(include="number").astype(float)
-    X = X.fillna(X.median())
-    return X, y, target
+
+    features = df.drop(columns=[target])
+
+    # Identify categorical columns — keep raw for API, encode for ML
+    cat_cols  = list(features.select_dtypes(include=["object","category","bool"]).columns)
+    encoders  = {}
+    X_raw     = features.copy()
+
+    # Convert booleans to strings for API
+    for col in cat_cols:
+        X_raw[col] = X_raw[col].astype(str)
+
+    # Build encoded version for sklearn
+    X_encoded = features.copy()
+    for col in cat_cols:
+        le = LabelEncoder()
+        X_encoded[col] = le.fit_transform(X_encoded[col].astype(str))
+        encoders[col]  = le
+    X_encoded = X_encoded.select_dtypes(include="number").astype(float).fillna(0)
+
+    return X_raw, X_encoded, y, target, cat_cols, encoders
 
 
 def call_api_batch(records: list, api_key: str) -> list:
@@ -441,40 +468,85 @@ def call_api_batch(records: list, api_key: str) -> list:
     return t if isinstance(t, list) else [t]
 
 
-def records_to_df(twins: list, original_df: pd.DataFrame) -> pd.DataFrame:
-    """Convert API twin records back to numeric DataFrame."""
+def records_to_df(
+    twins:       list,
+    original_df: pd.DataFrame,
+    cat_cols:    list,
+    encoders:    dict,
+) -> tuple:
+    """
+    Convert API twin records into two DataFrames:
+      twin_raw     — semantic values (Month=Aug, VisitorType=New_Visitor)
+                     → used for the download CSV (human-readable)
+      twin_encoded — numeric values for sklearn
+                     → used for ML training
+
+    Categorical fields twinned by the API as strings are preserved as-is
+    in twin_raw, and label-encoded for twin_encoded.
+    """
     cols    = list(original_df.columns)
     col_map = {c: c.replace(" ","_").replace("-","_").lower() for c in cols}
 
-    # Build string→int encoders for fields the API returns as strings
-    string_codes: dict[str, dict] = {}
+    # Collect all unique twin string values per categorical field
+    # to build stable encoders
+    new_string_vals: dict[str, set] = {}
     for rec in twins:
         for orig, clean in col_map.items():
+            if orig not in cat_cols:
+                continue
             val = rec.get(clean)
             if val is not None:
-                try:
-                    float(str(val).replace(",","").replace("$","").strip())
-                except (ValueError, TypeError):
-                    string_codes.setdefault(orig, set()).add(str(val))
-    string_codes = {f: {v: i for i,v in enumerate(sorted(vs))}
-                    for f, vs in string_codes.items()}
+                new_string_vals.setdefault(orig, set()).add(str(val))
 
-    rows = []
+    # Extend original encoders with any new categories from twin
+    extended_encoders = {}
+    for col in cat_cols:
+        orig_classes = list(encoders[col].classes_) if col in encoders else []
+        new_classes  = list(new_string_vals.get(col, set()))
+        all_classes  = sorted(set(orig_classes) | set(new_classes))
+        le = LabelEncoder()
+        le.fit(all_classes)
+        extended_encoders[col] = le
+
+    raw_rows = []
+    enc_rows = []
+
     for i, rec in enumerate(twins):
-        row = {}
+        raw_row = {}
+        enc_row = {}
         for orig, clean in col_map.items():
             val = rec.get(clean)
             if val is None:
                 raise ValueError(f"API did not return field '{orig}' in twin {i}.")
-            try:
-                parsed = float(str(val).replace(",","").replace("$","").strip())
-            except (ValueError, TypeError):
-                parsed = float(string_codes[orig].get(str(val), 0))
-            if math.isnan(parsed):
-                raise ValueError(f"API returned NaN for field '{orig}'.")
-            row[orig] = parsed
-        rows.append(row)
-    return pd.DataFrame(rows, columns=cols)
+
+            if orig in cat_cols:
+                # Keep semantic string value for raw
+                str_val      = str(val)
+                raw_row[orig] = str_val
+                # Encode to int for ML
+                enc_row[orig] = float(
+                    extended_encoders[orig].transform([str_val])[0]
+                )
+            else:
+                # Numeric field
+                try:
+                    parsed = float(str(val).replace(",","").replace("$","").strip())
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"API returned non-numeric value '{val}' "
+                        f"for numeric field '{orig}'."
+                    )
+                if math.isnan(parsed):
+                    raise ValueError(f"API returned NaN for field '{orig}'.")
+                raw_row[orig] = parsed
+                enc_row[orig] = parsed
+
+        raw_rows.append(raw_row)
+        enc_rows.append(enc_row)
+
+    twin_raw     = pd.DataFrame(raw_rows, columns=cols)
+    twin_encoded = pd.DataFrame(enc_rows, columns=cols).astype(float)
+    return twin_raw, twin_encoded
 
 
 # ── Background job ────────────────────────────────────────────────────────────
@@ -491,18 +563,24 @@ async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key
         if len(df) < 50:
             send("result", {"error": "Need at least 50 rows."}); return
 
-        X, y, target = prepare(df)
-        if X.shape[1] == 0:
-            send("result", {"error": "No numeric feature columns found."}); return
+        X_raw, X_encoded, y, target, cat_cols, encoders = prepare(df)
+        if X_encoded.shape[1] == 0:
+            send("result", {"error": "No feature columns found."}); return
 
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+        # Split — keep raw and encoded in sync
+        idx_tr, idx_te = train_test_split(
+            range(len(X_raw)), test_size=0.20, stratify=y, random_state=RANDOM_STATE
         )
+        X_tr_raw = X_raw.iloc[idx_tr].reset_index(drop=True)
+        X_te_enc = X_encoded.iloc[idx_te].reset_index(drop=True)
+        X_tr_enc = X_encoded.iloc[idx_tr].reset_index(drop=True)
+        y_tr     = y.iloc[idx_tr].reset_index(drop=True)
+        y_te     = y.iloc[idx_te].reset_index(drop=True)
 
-        # Twin in batches — stream progress
-        cols    = list(X_tr.columns)
+        # Twin in batches — send RAW values so API twins semantically
+        cols    = list(X_tr_raw.columns)
         col_map = {c: c.replace(" ","_").replace("-","_").lower() for c in cols}
-        records = X_tr.rename(columns=col_map).to_dict(orient="records")
+        records = X_tr_raw.rename(columns=col_map).to_dict(orient="records")
         n       = len(records)
         n_b     = math.ceil(n / BATCH_SIZE)
         all_twins = []
@@ -526,8 +604,8 @@ async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key
                 "elapsed": round(time.time() - t0, 1),
             })
 
-        # Convert to DataFrame
-        X_tw = records_to_df(all_twins, X_tr)
+        # Convert twins — get semantic (for download) + encoded (for ML)
+        twin_raw, X_tw_enc = records_to_df(all_twins, X_tr_raw, cat_cols, encoders)
 
         # Train models
         send("training", {})
@@ -544,20 +622,20 @@ async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key
         loop = asyncio.get_event_loop()
 
         def train_both():
-            mr = make_model(); mr.fit(X_tr, y_tr)
-            mt = make_model(); mt.fit(X_tw, y_tr)
-            pred_r = mr.predict(X_te)
-            pred_t = mt.predict(X_te)
-            auc_r  = roc_auc_score(y_te, mr.predict_proba(X_te)[:,1])
-            auc_t  = roc_auc_score(y_te, mt.predict_proba(X_te)[:,1])
+            mr = make_model(); mr.fit(X_tr_enc, y_tr)
+            mt = make_model(); mt.fit(X_tw_enc, y_tr)
+            pred_r = mr.predict(X_te_enc)
+            pred_t = mt.predict(X_te_enc)
+            auc_r  = roc_auc_score(y_te, mr.predict_proba(X_te_enc)[:,1])
+            auc_t  = roc_auc_score(y_te, mt.predict_proba(X_te_enc)[:,1])
             return pred_r, pred_t, auc_r, auc_t
 
         pred_r, pred_t, auc_r, auc_t = await loop.run_in_executor(None, train_both)
 
         agreement = float(np.mean(pred_r == pred_t)) * 100
 
-        # Build twin CSV — full twinned training set
-        twin_df_full = X_tw.copy()
+        # Build twin CSV — semantic values (Month=Aug, not 1.6)
+        twin_df_full = twin_raw.copy()
         twin_df_full[target] = y_tr.values
         csv_bytes  = twin_df_full.to_csv(index=False).encode()
         csv_b64    = base64.b64encode(csv_bytes).decode()
