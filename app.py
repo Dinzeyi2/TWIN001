@@ -531,18 +531,23 @@ def records_to_df(
                     extended_encoders[orig].transform([str_val])[0]
                 )
             else:
-                # Numeric field
+                # Numeric field — but API may return a formatted string
+                # (e.g. NDC code 59148-0017-13, date 2024-03-15)
+                # Try float first; if it's a string, hash-encode it.
+                val_str = str(val).replace(",","").replace("$","").strip()
                 try:
-                    parsed = float(str(val).replace(",","").replace("$","").strip())
+                    parsed = float(val_str)
+                    if math.isnan(parsed):
+                        parsed = 0.0
+                    raw_row[orig] = parsed
+                    enc_row[orig] = parsed
                 except (ValueError, TypeError):
-                    raise ValueError(
-                        f"API returned non-numeric value '{val}' "
-                        f"for numeric field '{orig}'."
-                    )
-                if math.isnan(parsed):
-                    raise ValueError(f"API returned NaN for field '{orig}'.")
-                raw_row[orig] = parsed
-                enc_row[orig] = parsed
+                    # API returned a semantic string for this field
+                    # Use stable hash so the same string always → same int
+                    import hashlib
+                    code = int(hashlib.md5(val_str.encode()).hexdigest()[:8], 16) % 100000
+                    raw_row[orig] = val_str   # human-readable in download
+                    enc_row[orig] = float(code)  # stable int for sklearn
 
         raw_rows.append(raw_row)
         enc_rows.append(enc_row)
