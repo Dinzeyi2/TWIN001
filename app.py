@@ -1,7 +1,8 @@
 """
-Codeastra Decision Fidelity Benchmark — Railway Web App
+Codeastra Decision Fidelity Benchmark
+Real-time streaming + twin data download
 """
-import os, io, json, time, math, warnings
+import asyncio, base64, io, json, math, os, time, uuid, warnings
 from datetime import datetime
 
 import numpy  as np
@@ -14,22 +15,21 @@ from sklearn.pipeline        import Pipeline
 
 import requests as _requests
 from fastapi           import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 warnings.filterwarnings("ignore")
 
 app = FastAPI(title="Codeastra Decision Fidelity Benchmark", version="1.0")
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
 CODEASTRA_BASE = "https://app.codeastra.dev"
 BATCH_SIZE     = 100
 RANDOM_STATE   = 42
+
+# Job queues — each running benchmark gets its own asyncio.Queue
+_jobs: dict[str, asyncio.Queue] = {}
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
@@ -42,330 +42,122 @@ HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
 :root {
-  --bg:       #06060e;
-  --card:     #0c0c18;
-  --border:   #16163a;
-  --blue:     #4f7fff;
-  --green:    #00d68f;
-  --gold:     #f5c842;
-  --red:      #ff4d6d;
-  --text:     #eeeef8;
-  --muted:    #52527a;
-  --mono:     'DM Mono', monospace;
-  --serif:    'Instrument Serif', serif;
-  --sans:     'DM Sans', sans-serif;
+  --bg:#06060e; --card:#0c0c18; --border:#16163a;
+  --blue:#4f7fff; --green:#00d68f; --gold:#f5c842; --red:#ff4d6d;
+  --text:#eeeef8; --muted:#52527a;
+  --mono:'DM Mono',monospace; --serif:'Instrument Serif',serif; --sans:'DM Sans',sans-serif;
 }
+body { background:var(--bg); color:var(--text); font-family:var(--sans);
+       min-height:100vh; display:flex; flex-direction:column; align-items:center; }
 
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
+header { width:100%; max-width:620px; padding:72px 24px 0; text-align:center; }
+.eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.22em;
+           color:var(--blue); text-transform:uppercase; margin-bottom:24px; }
+h1 { font-family:var(--serif); font-size:clamp(36px,6vw,52px); font-weight:400;
+     line-height:1.1; margin-bottom:20px; }
+h1 em { font-style:italic; color:var(--green); }
+.sub { font-size:15px; color:var(--muted); line-height:1.75; margin-bottom:60px;
+       max-width:460px; margin-left:auto; margin-right:auto; }
 
-/* ── Header ── */
-header {
-  width: 100%;
-  max-width: 620px;
-  padding: 72px 24px 0;
-  text-align: center;
-}
-.eyebrow {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.22em;
-  color: var(--blue);
-  text-transform: uppercase;
-  margin-bottom: 24px;
-}
-h1 {
-  font-family: var(--serif);
-  font-size: clamp(36px, 6vw, 56px);
-  font-weight: 400;
-  line-height: 1.1;
-  margin-bottom: 20px;
-  letter-spacing: -0.01em;
-}
-h1 em {
-  font-style: italic;
-  color: var(--green);
-}
-.sub {
-  font-size: 15px;
-  color: var(--muted);
-  line-height: 1.75;
-  margin-bottom: 60px;
-  max-width: 460px;
-  margin-left: auto;
-  margin-right: auto;
-}
+.card { width:100%; max-width:580px; padding:0 24px; margin-bottom:20px; }
+.card-inner { background:var(--card); border:1px solid var(--border);
+              border-radius:16px; padding:36px; }
 
-/* ── Upload card ── */
-.card {
-  width: 100%;
-  max-width: 560px;
-  padding: 0 24px;
-  margin-bottom: 20px;
-}
-.card-inner {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 36px;
-}
+/* Drop zone */
+.drop { border:1.5px dashed var(--border); border-radius:10px; padding:44px 24px;
+        text-align:center; cursor:pointer; position:relative;
+        transition:border-color .2s,background .2s; margin-bottom:20px; }
+.drop:hover,.drop.over { border-color:var(--blue); background:rgba(79,127,255,.04); }
+.drop input { position:absolute; inset:0; opacity:0; cursor:pointer; width:100%; height:100%; }
+.drop-icon { font-size:28px; margin-bottom:10px; }
+.drop-main { font-size:14px; font-weight:500; margin-bottom:4px; }
+.drop-hint { font-size:11px; font-family:var(--mono); color:var(--muted); }
+.drop-chosen { margin-top:10px; font-size:12px; font-family:var(--mono); color:var(--green); }
 
-/* ── Drop zone ── */
-.drop {
-  border: 1.5px dashed var(--border);
-  border-radius: 10px;
-  padding: 44px 24px;
-  text-align: center;
-  cursor: pointer;
-  position: relative;
-  transition: border-color .2s, background .2s;
-  margin-bottom: 20px;
-}
-.drop:hover, .drop.over {
-  border-color: var(--blue);
-  background: rgba(79,127,255,.04);
-}
-.drop input {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  cursor: pointer;
-  width: 100%;
-  height: 100%;
-}
-.drop-icon { font-size: 28px; margin-bottom: 10px; }
-.drop-main { font-size: 14px; font-weight: 500; margin-bottom: 4px; }
-.drop-hint { font-size: 11px; font-family: var(--mono); color: var(--muted); }
-.drop-chosen {
-  margin-top: 10px;
-  font-size: 12px;
-  font-family: var(--mono);
-  color: var(--green);
-}
+.key-label { display:block; font-size:11px; font-family:var(--mono);
+             color:var(--muted); letter-spacing:.06em; margin-bottom:8px; }
+.key-input { width:100%; background:var(--bg); border:1px solid var(--border);
+             border-radius:8px; padding:13px 14px; color:var(--text);
+             font-family:var(--mono); font-size:13px; outline:none;
+             transition:border-color .2s; margin-bottom:24px; }
+.key-input:focus { border-color:var(--blue); }
+.key-input::placeholder { color:var(--muted); }
 
-/* ── Key input ── */
-.key-wrap { position: relative; margin-bottom: 24px; }
-.key-label {
-  display: block;
-  font-size: 11px;
-  font-family: var(--mono);
-  color: var(--muted);
-  letter-spacing: .06em;
-  margin-bottom: 8px;
-}
-.key-input {
-  width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 13px 14px;
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 13px;
-  outline: none;
-  transition: border-color .2s;
-}
-.key-input:focus { border-color: var(--blue); }
-.key-input::placeholder { color: var(--muted); }
+.btn { width:100%; padding:15px; background:var(--blue); color:#fff;
+       font-family:var(--sans); font-size:15px; font-weight:600; border:none;
+       border-radius:8px; cursor:pointer; transition:opacity .18s; }
+.btn:hover:not(:disabled) { opacity:.85; }
+.btn:disabled { opacity:.35; cursor:not-allowed; }
 
-/* ── Run button ── */
-.btn {
-  width: 100%;
-  padding: 15px;
-  background: var(--blue);
-  color: #fff;
-  font-family: var(--sans);
-  font-size: 15px;
-  font-weight: 600;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: opacity .18s;
-  letter-spacing: .01em;
-}
-.btn:hover:not(:disabled) { opacity: .85; }
-.btn:disabled { opacity: .35; cursor: not-allowed; }
+/* Progress stream */
+#streamBox { display:none; margin-top:28px; }
+.stream-label { font-family:var(--mono); font-size:10px; letter-spacing:.18em;
+                color:var(--blue); text-transform:uppercase; margin-bottom:14px;
+                display:flex; align-items:center; gap:10px; }
+.stream-label::after { content:''; flex:1; height:1px; background:var(--border); }
+.progress-bar-wrap { background:var(--bg); border:1px solid var(--border);
+                     border-radius:6px; height:6px; margin-bottom:16px; overflow:hidden; }
+.progress-bar { height:100%; background:var(--green); width:0%;
+                transition:width .4s ease; border-radius:6px; }
+.batch-log { max-height:160px; overflow-y:auto; font-family:var(--mono);
+             font-size:11px; color:var(--muted); line-height:1.8; }
+.batch-log .done  { color:var(--green); }
+.batch-log .active { color:var(--text); }
 
-/* ── State bar ── */
-.state-bar {
-  width: 100%;
-  max-width: 560px;
-  padding: 0 24px;
-  margin-bottom: 20px;
-  display: none;
-}
-.state-inner {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px 24px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.spinner {
-  width: 18px; height: 18px;
-  border: 2px solid var(--border);
-  border-top-color: var(--blue);
-  border-radius: 50%;
-  animation: spin .7s linear infinite;
-  flex-shrink: 0;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
+/* Error */
+.err { background:rgba(255,77,109,.07); border:1px solid rgba(255,77,109,.25);
+       border-radius:10px; padding:16px 20px; font-family:var(--mono);
+       font-size:12px; color:var(--red); line-height:1.6;
+       margin-top:16px; display:none; }
 
-/* ── Error ── */
-.err {
-  width: 100%;
-  max-width: 560px;
-  padding: 0 24px;
-  margin-bottom: 20px;
-  display: none;
-}
-.err-inner {
-  background: rgba(255,77,109,.07);
-  border: 1px solid rgba(255,77,109,.25);
-  border-radius: 10px;
-  padding: 16px 20px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--red);
-  line-height: 1.6;
-}
+/* Results */
+#resultsBox { display:none; }
+.hero { text-align:center; padding:32px 0 36px;
+        border-bottom:1px solid var(--border); margin-bottom:32px; }
+.hero-num { font-family:var(--serif); font-size:88px; line-height:1;
+            color:var(--green); margin-bottom:8px; letter-spacing:-.04em; }
+.hero-label { font-family:var(--mono); font-size:11px; letter-spacing:.18em;
+              color:var(--muted); text-transform:uppercase; }
+.hero-file { margin-top:8px; font-size:12px; font-family:var(--mono); color:var(--muted); }
 
-/* ── Results ── */
-.results {
-  width: 100%;
-  max-width: 560px;
-  padding: 0 24px;
-  margin-bottom: 60px;
-  display: none;
-}
-.results-inner {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 36px;
-}
+.auc-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:28px; }
+.auc-box { background:var(--bg); border:1px solid var(--border);
+           border-radius:10px; padding:20px; text-align:center; }
+.auc-val { font-family:var(--mono); font-size:26px; font-weight:500; margin-bottom:6px; }
+.auc-lbl { font-family:var(--mono); font-size:10px; color:var(--muted);
+           letter-spacing:.1em; text-transform:uppercase; }
 
-/* Hero agreement */
-.hero {
-  text-align: center;
-  padding: 32px 0 36px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 32px;
-}
-.hero-num {
-  font-family: var(--serif);
-  font-size: 88px;
-  line-height: 1;
-  color: var(--green);
-  margin-bottom: 8px;
-  letter-spacing: -0.04em;
-}
-.hero-label {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: .18em;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-.hero-file {
-  margin-top: 8px;
-  font-size: 12px;
-  font-family: var(--mono);
-  color: var(--muted);
-}
+.verdict { font-size:14px; line-height:1.8; color:var(--muted); text-align:center;
+           padding:24px; background:var(--bg); border:1px solid var(--border);
+           border-radius:10px; margin-bottom:20px; }
+.verdict strong { color:var(--gold); font-weight:500; }
 
-/* AUC row */
-.auc-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 28px;
-}
-.auc-box {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 20px;
-  text-align: center;
-}
-.auc-val {
-  font-family: var(--mono);
-  font-size: 26px;
-  font-weight: 500;
-  margin-bottom: 6px;
-}
-.auc-lbl {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
-  letter-spacing: .1em;
-  text-transform: uppercase;
-}
-
-/* Verdict */
-.verdict {
-  font-size: 14px;
-  line-height: 1.8;
-  color: var(--muted);
-  text-align: center;
-  padding: 24px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  margin-bottom: 20px;
-}
-.verdict strong { color: var(--gold); font-weight: 500; }
-
-/* Run again */
-.run-again {
-  display: block;
-  width: 100%;
-  padding: 13px;
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--muted);
-  font-family: var(--sans);
-  font-size: 13px;
-  cursor: pointer;
-  text-align: center;
-  transition: border-color .2s, color .2s;
-}
-.run-again:hover { border-color: var(--blue); color: var(--text); }
-
-footer {
-  padding: 0 0 40px;
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
-  letter-spacing: .08em;
-}
+/* Download button */
+.btn-download { width:100%; padding:15px; background:transparent;
+                border:1.5px solid var(--green); color:var(--green);
+                font-family:var(--sans); font-size:15px; font-weight:600;
+                border-radius:8px; cursor:pointer; transition:background .18s,color .18s;
+                margin-bottom:12px; display:none; }
+.btn-download:hover { background:var(--green); color:var(--bg); }
+.btn-again { width:100%; padding:13px; background:transparent;
+             border:1px solid var(--border); border-radius:8px; color:var(--muted);
+             font-family:var(--sans); font-size:13px; cursor:pointer;
+             transition:border-color .2s,color .2s; }
+.btn-again:hover { border-color:var(--blue); color:var(--text); }
+footer { padding:0 0 40px; font-family:var(--mono); font-size:10px;
+         color:var(--muted); letter-spacing:.08em; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="eyebrow">Codeastra</div>
-  <h1>Does your<br>twin data make<br><em>the same decisions?</em></h1>
-  <p class="sub">Upload any dataset. We twin it, train two models,
-  and measure how often they agree — without ever exposing the real data.</p>
+  <h1>Does your twin data make<br><em>the same decisions?</em></h1>
+  <p class="sub">Upload any dataset. We twin it via the Codeastra API,
+  benchmark real vs twin models, and let you download your twinned data.</p>
 </header>
 
-<!-- Upload card -->
 <div class="card">
   <div class="card-inner">
 
@@ -377,42 +169,30 @@ footer {
       <div class="drop-chosen" id="dropChosen"></div>
     </div>
 
-    <div class="key-wrap">
-      <label class="key-label" for="apiKey">Codeastra API Key</label>
-      <input class="key-input" type="password" id="apiKey"
-             placeholder="sk-guard-...">
+    <label class="key-label" for="apiKey">Codeastra API Key</label>
+    <input class="key-input" type="password" id="apiKey" placeholder="sk-guard-...">
+
+    <button class="btn" id="runBtn" onclick="run()" disabled>Run Benchmark</button>
+
+    <!-- Live stream -->
+    <div id="streamBox">
+      <div class="stream-label">Twinning in progress</div>
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="batch-log" id="batchLog"></div>
     </div>
 
-    <button class="btn" id="runBtn" onclick="run()" disabled>
-      Run Benchmark
-    </button>
-
+    <div class="err" id="errBox"></div>
   </div>
-</div>
-
-<!-- State -->
-<div class="state-bar" id="stateBar">
-  <div class="state-inner">
-    <div class="spinner"></div>
-    <span id="stateMsg">Twinning your data via Codeastra API…</span>
-  </div>
-</div>
-
-<!-- Error -->
-<div class="err" id="errBox">
-  <div class="err-inner" id="errMsg"></div>
 </div>
 
 <!-- Results -->
-<div class="results" id="resultsBox">
-  <div class="results-inner">
-
+<div class="card" id="resultsBox">
+  <div class="card-inner">
     <div class="hero">
       <div class="hero-num" id="rAgreement">—</div>
       <div class="hero-label">Prediction Agreement</div>
       <div class="hero-file" id="rFile"></div>
     </div>
-
     <div class="auc-row">
       <div class="auc-box">
         <div class="auc-val" style="color:#4f7fff" id="rRealAuc">—</div>
@@ -423,11 +203,11 @@ footer {
         <div class="auc-lbl">Twin Data AUC</div>
       </div>
     </div>
-
     <div class="verdict" id="rVerdict"></div>
-
-    <button class="run-again" onclick="reset()">Run another dataset</button>
-
+    <button class="btn-download" id="btnDownload" onclick="downloadTwins()">
+      ↓ Download Twin Data (CSV)
+    </button>
+    <button class="btn-again" onclick="reset()">Run another dataset</button>
   </div>
 </div>
 
@@ -435,10 +215,13 @@ footer {
 
 <script>
 let currentFile = null;
+let twinCsvB64  = null;
+let twinFilename = null;
 
+// Drop zone
 const drop = document.getElementById('drop');
 drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('over'); });
-drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('dragleave', ()  => drop.classList.remove('over'));
 drop.addEventListener('drop', e => {
   e.preventDefault(); drop.classList.remove('over');
   const f = e.dataTransfer.files[0];
@@ -451,121 +234,175 @@ document.getElementById('apiKey').addEventListener('input', checkReady);
 
 function setFile(f) {
   currentFile = f;
-  document.getElementById('fileInput').files;
   document.getElementById('dropChosen').textContent = '✓ ' + f.name;
   drop.style.borderColor = 'var(--green)';
   checkReady();
 }
-
 function checkReady() {
   const ok = currentFile && document.getElementById('apiKey').value.trim().length > 10;
   document.getElementById('runBtn').disabled = !ok;
 }
 
-function setState(msg) {
-  document.getElementById('stateMsg').textContent = msg;
-  document.getElementById('stateBar').style.display = 'block';
-}
-
 async function run() {
   const apiKey = document.getElementById('apiKey').value.trim();
+  twinCsvB64   = null;
+  twinFilename = null;
   hide('errBox'); hide('resultsBox');
+  document.getElementById('btnDownload').style.display = 'none';
   document.getElementById('runBtn').disabled = true;
+  document.getElementById('batchLog').innerHTML = '';
+  document.getElementById('progressBar').style.width = '0%';
+  show('streamBox');
 
-  setState('Twinning your data via Codeastra API…');
-
+  // Step 1: Upload file, get job_id
   const fd = new FormData();
   fd.append('file',    currentFile);
   fd.append('api_key', apiKey);
 
+  let jobId;
   try {
-    setState('Twinning your data via Codeastra API…');
-    const r = await fetch('/benchmark', { method: 'POST', body: fd });
+    const r = await fetch('/start', { method: 'POST', body: fd });
     if (!r.ok) {
       const e = await r.json().catch(() => ({ detail: r.statusText }));
-      throw new Error(e.detail || 'Benchmark failed');
+      throw new Error(e.detail || 'Upload failed');
     }
-    setState('Training models…');
-    const data = await r.json();
-    show(data);
-  } catch (e) {
-    document.getElementById('errMsg').textContent = '⚠  ' + (e.message || String(e));
-    show_el('errBox');
-  } finally {
-    hide('stateBar');
+    const d = await r.json();
+    jobId = d.job_id;
+  } catch(e) {
+    showErr(e.message);
     document.getElementById('runBtn').disabled = false;
+    hide('streamBox');
+    return;
   }
+
+  // Step 2: Stream SSE events
+  const es = new EventSource('/stream/' + jobId);
+
+  es.addEventListener('batch', e => {
+    const d = JSON.parse(e.data);
+    const pct = Math.round(d.batch / d.total * 100);
+    document.getElementById('progressBar').style.width = pct + '%';
+    const log = document.getElementById('batchLog');
+    // Mark previous active as done
+    const prev = log.querySelector('.active');
+    if (prev) prev.className = 'done';
+    const line = document.createElement('div');
+    line.className = 'active';
+    line.textContent = `Batch ${d.batch}/${d.total} twinned ✓ (${d.elapsed}s)`;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  });
+
+  es.addEventListener('training', e => {
+    const log = document.getElementById('batchLog');
+    const prev = log.querySelector('.active');
+    if (prev) prev.className = 'done';
+    const line = document.createElement('div');
+    line.className = 'active';
+    line.textContent = 'Training models on real and twin data…';
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  });
+
+  es.addEventListener('result', e => {
+    es.close();
+    document.getElementById('progressBar').style.width = '100%';
+    const prev = document.getElementById('batchLog').querySelector('.active');
+    if (prev) prev.className = 'done';
+    hide('streamBox');
+    document.getElementById('runBtn').disabled = false;
+
+    const d = JSON.parse(e.data);
+    if (d.error) { showErr(d.error); return; }
+
+    showResults(d);
+    if (d.twin_csv_b64) {
+      twinCsvB64  = d.twin_csv_b64;
+      twinFilename = d.twin_filename;
+      document.getElementById('btnDownload').style.display = 'block';
+    }
+  });
+
+  es.onerror = () => {
+    es.close();
+    showErr('Connection lost. Please try again.');
+    document.getElementById('runBtn').disabled = false;
+    hide('streamBox');
+  };
 }
 
-function show(data) {
-  const agree = data.agreement.toFixed(1);
+function showResults(d) {
+  const agree = d.agreement.toFixed(1);
   document.getElementById('rAgreement').textContent = agree + '%';
-  document.getElementById('rFile').textContent      = data.filename;
-  document.getElementById('rRealAuc').textContent   = data.real_auc.toFixed(4);
-  document.getElementById('rTwinAuc').textContent   = data.twin_auc.toFixed(4);
-
-  const auc_diff = data.twin_auc - data.real_auc;
-  const q = data.agreement >= 95 ? 'virtually identical'
-          : data.agreement >= 90 ? 'nearly identical'
-          : 'similar';
+  document.getElementById('rFile').textContent      = d.filename;
+  document.getElementById('rRealAuc').textContent   = d.real_auc.toFixed(4);
+  document.getElementById('rTwinAuc').textContent   = d.twin_auc.toFixed(4);
+  const q = d.agreement >= 95 ? 'virtually identical'
+          : d.agreement >= 90 ? 'nearly identical' : 'similar';
   document.getElementById('rVerdict').innerHTML =
-    `Models trained on <strong>Codeastra twin data</strong> reached ${q} decisions
-     to models trained on the original data —
-     <strong>${agree}%</strong> agreement on
-     <strong>${data.n_test.toLocaleString()} held-out real records</strong>
-     that were never sent to the API.`;
-
-  show_el('resultsBox');
+    `Models trained on <strong>Codeastra twin data</strong> reached ${q} decisions ` +
+    `to models trained on original data — <strong>${agree}%</strong> agreement ` +
+    `on <strong>${d.n_test.toLocaleString()} held-out real records</strong> ` +
+    `never sent to the API.`;
+  show('resultsBox');
   document.getElementById('resultsBox').scrollIntoView({ behavior: 'smooth' });
 }
 
+function downloadTwins() {
+  if (!twinCsvB64) return;
+  const bytes  = atob(twinCsvB64);
+  const arr    = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  const blob   = new Blob([arr], { type: 'text/csv' });
+  const url    = URL.createObjectURL(blob);
+  const a      = document.createElement('a');
+  a.href       = url;
+  a.download   = twinFilename || 'codeastra_twins.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function reset() {
-  currentFile = null;
+  currentFile = null; twinCsvB64 = null; twinFilename = null;
   document.getElementById('fileInput').value = '';
   document.getElementById('dropChosen').textContent = '';
   document.getElementById('drop').style.borderColor = '';
-  hide('resultsBox'); hide('errBox');
+  document.getElementById('btnDownload').style.display = 'none';
+  hide('resultsBox'); hide('errBox'); hide('streamBox');
   checkReady();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-function hide(id)    { document.getElementById(id).style.display = 'none'; }
-function show_el(id) { document.getElementById(id).style.display = 'block'; }
+function showErr(msg) {
+  document.getElementById('errBox').textContent = '⚠  ' + msg;
+  show('errBox');
+}
+function show(id) { document.getElementById(id).style.display = 'block'; }
+function hide(id) { document.getElementById(id).style.display = 'none'; }
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def read_file(contents: bytes, filename: str) -> pd.DataFrame:
-    if filename.endswith((".xls",)):
+    if filename.endswith(".xls"):
         return pd.read_excel(io.BytesIO(contents), engine="xlrd")
-    if filename.endswith((".xlsx",)):
+    if filename.endswith(".xlsx"):
         return pd.read_excel(io.BytesIO(contents), engine="openpyxl")
-    # CSV — detect separator
     sample = contents[:4096].decode("utf-8", errors="ignore")
     sep    = ";" if sample.count(";") > sample.count(",") else ","
     return pd.read_csv(io.BytesIO(contents), sep=sep)
 
 
 def prepare(df: pd.DataFrame):
-    """
-    Auto-detect target (last column), encode categoricals, return X, y, target.
-    Also returns col_types so twin_df knows which fields were categorical.
-    """
     target = df.columns[-1]
     df     = df.copy().dropna(subset=[target])
-
-    # Encode categorical features
-    col_encoders = {}
     for col in df.select_dtypes(include=["object","category","bool"]).columns:
         if col != target:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-            col_encoders[col] = le
-
-    # Encode target
+            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
     y_raw = df[target]
     if y_raw.dtype == object or str(y_raw.dtype) in ("category","string","bool"):
         classes = sorted(y_raw.astype(str).unique())
@@ -573,24 +410,18 @@ def prepare(df: pd.DataFrame):
     else:
         try:
             y_num = pd.to_numeric(y_raw, errors="raise")
-            if y_num.nunique() <= 10:
-                y = (y_num > 0).astype(int) if y_num.max() > 1 else y_num.astype(int)
-            else:
-                y = (y_num > y_num.median()).astype(int)
+            y = (y_num > 0).astype(int) if y_num.max() > 1 else y_num.astype(int)
         except Exception:
             classes = sorted(y_raw.astype(str).unique())
             y = (y_raw.astype(str) == classes[-1]).astype(int)
-
     X = df.drop(columns=[target]).select_dtypes(include="number").astype(float)
     X = X.fillna(X.median())
-    return X, y, target, col_encoders
+    return X, y, target
 
 
-def call_api(records: list, api_key: str) -> list:
-    """Call Codeastra /twin/think. Raises immediately on any error — no retries, no fallbacks."""
+def call_api_batch(records: list, api_key: str) -> list:
     clean = [
-        {k.replace(" ","_").replace("-","_").lower(): str(v)
-         for k, v in r.items()}
+        {k.replace(" ","_").replace("-","_").lower(): str(v) for k,v in r.items()}
         for r in records
     ]
     resp = _requests.post(
@@ -599,40 +430,24 @@ def call_api(records: list, api_key: str) -> list:
         json={"data": clean, "task_type": "general", "agent_role": "assistant"},
         timeout=90,
     )
-    if resp.status_code == 401 or resp.status_code == 403:
-        raise HTTPException(401, "Invalid API key. Check your Codeastra API key and try again.")
+    if resp.status_code in (401, 403):
+        raise ValueError("Invalid API key.")
     if resp.status_code != 200:
-        raise HTTPException(502, f"Codeastra API returned {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    twinned = data.get("twinned_data", [])
-    if not twinned:
-        raise HTTPException(502, "Codeastra API returned empty twinned_data.")
-    return twinned if isinstance(twinned, list) else [twinned]
+        raise ValueError(f"Codeastra API {resp.status_code}: {resp.text[:200]}")
+    d = resp.json()
+    t = d.get("twinned_data", [])
+    if not t:
+        raise ValueError("Codeastra API returned empty twinned_data.")
+    return t if isinstance(t, list) else [t]
 
 
-def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
-    """
-    Twin every row via the Codeastra API.
-
-    The API twins identity/categorical fields as strings (e.g. occupation → "Project Manager")
-    and numeric fields as numbers. Both are valid twins — we hash-encode strings back
-    to stable integers so sklearn can use them. Real values are never substituted.
-    """
-    cols    = list(df.columns)
+def records_to_df(twins: list, original_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert API twin records back to numeric DataFrame."""
+    cols    = list(original_df.columns)
     col_map = {c: c.replace(" ","_").replace("-","_").lower() for c in cols}
-    records = df.rename(columns=col_map).to_dict(orient="records")
-    twins   = []
 
-    for i in range(0, len(records), BATCH_SIZE):
-        batch_twins = call_api(records[i: i + BATCH_SIZE], api_key)
-        if len(batch_twins) != len(records[i: i + BATCH_SIZE]):
-            raise HTTPException(502,
-                f"Codeastra API returned {len(batch_twins)} twins "
-                f"for {len(records[i:i+BATCH_SIZE])} records.")
-        twins.extend(batch_twins)
-
-    # Build stable hash-encoders for any field the API returns as strings
-    string_vals: dict[str, set] = {}
+    # Build string→int encoders for fields the API returns as strings
+    string_codes: dict[str, dict] = {}
     for rec in twins:
         for orig, clean in col_map.items():
             val = rec.get(clean)
@@ -640,13 +455,9 @@ def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
                 try:
                     float(str(val).replace(",","").replace("$","").strip())
                 except (ValueError, TypeError):
-                    string_vals.setdefault(orig, set()).add(str(val))
-
-    # Assign stable integer codes to each unique string value per field
-    string_codes: dict[str, dict] = {
-        field: {v: idx for idx, v in enumerate(sorted(vals))}
-        for field, vals in string_vals.items()
-    }
+                    string_codes.setdefault(orig, set()).add(str(val))
+    string_codes = {f: {v: i for i,v in enumerate(sorted(vs))}
+                    for f, vs in string_codes.items()}
 
     rows = []
     for i, rec in enumerate(twins):
@@ -654,101 +465,182 @@ def twin_df(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
         for orig, clean in col_map.items():
             val = rec.get(clean)
             if val is None:
-                raise HTTPException(502,
-                    f"Codeastra API did not return field '{orig}' in twin record {i}.")
-            val_str = str(val).replace(",","").replace("$","").strip()
+                raise ValueError(f"API did not return field '{orig}' in twin {i}.")
             try:
-                parsed = float(val_str)
+                parsed = float(str(val).replace(",","").replace("$","").strip())
             except (ValueError, TypeError):
-                # API twinned this as a string (categorical field) — encode to int
                 parsed = float(string_codes[orig].get(str(val), 0))
             if math.isnan(parsed):
-                raise HTTPException(502,
-                    f"Codeastra API returned NaN for field '{orig}'.")
+                raise ValueError(f"API returned NaN for field '{orig}'.")
             row[orig] = parsed
         rows.append(row)
-
     return pd.DataFrame(rows, columns=cols)
+
+
+# ── Background job ────────────────────────────────────────────────────────────
+
+async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key: str):
+    q = _jobs[job_id]
+
+    def send(event: str, data: dict):
+        q.put_nowait({"event": event, "data": data})
+
+    try:
+        # Read + prepare
+        df = read_file(contents, filename)
+        if len(df) < 50:
+            send("result", {"error": "Need at least 50 rows."}); return
+
+        X, y, target = prepare(df)
+        if X.shape[1] == 0:
+            send("result", {"error": "No numeric feature columns found."}); return
+
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+        )
+
+        # Twin in batches — stream progress
+        cols    = list(X_tr.columns)
+        col_map = {c: c.replace(" ","_").replace("-","_").lower() for c in cols}
+        records = X_tr.rename(columns=col_map).to_dict(orient="records")
+        n       = len(records)
+        n_b     = math.ceil(n / BATCH_SIZE)
+        all_twins = []
+
+        for i in range(0, n, BATCH_SIZE):
+            batch_num = i // BATCH_SIZE + 1
+            t0 = time.time()
+            # Run sync call in thread pool so we don't block the event loop
+            loop = asyncio.get_event_loop()
+            batch_twins = await loop.run_in_executor(
+                None, call_api_batch, records[i:i+BATCH_SIZE], api_key
+            )
+            if len(batch_twins) != len(records[i:i+BATCH_SIZE]):
+                raise ValueError(
+                    f"API returned {len(batch_twins)} twins for {len(records[i:i+BATCH_SIZE])} records."
+                )
+            all_twins.extend(batch_twins)
+            send("batch", {
+                "batch":   batch_num,
+                "total":   n_b,
+                "elapsed": round(time.time() - t0, 1),
+            })
+
+        # Convert to DataFrame
+        X_tw = records_to_df(all_twins, X_tr)
+
+        # Train models
+        send("training", {})
+
+        def make_model():
+            return Pipeline([
+                ("sc", StandardScaler()),
+                ("rf", RandomForestClassifier(
+                    200, max_depth=8, min_samples_leaf=5,
+                    random_state=RANDOM_STATE, n_jobs=-1
+                ))
+            ])
+
+        loop = asyncio.get_event_loop()
+
+        def train_both():
+            mr = make_model(); mr.fit(X_tr, y_tr)
+            mt = make_model(); mt.fit(X_tw, y_tr)
+            pred_r = mr.predict(X_te)
+            pred_t = mt.predict(X_te)
+            auc_r  = roc_auc_score(y_te, mr.predict_proba(X_te)[:,1])
+            auc_t  = roc_auc_score(y_te, mt.predict_proba(X_te)[:,1])
+            return pred_r, pred_t, auc_r, auc_t
+
+        pred_r, pred_t, auc_r, auc_t = await loop.run_in_executor(None, train_both)
+
+        agreement = float(np.mean(pred_r == pred_t)) * 100
+
+        # Build twin CSV — full twinned training set
+        twin_df_full = X_tw.copy()
+        twin_df_full[target] = y_tr.values
+        csv_bytes  = twin_df_full.to_csv(index=False).encode()
+        csv_b64    = base64.b64encode(csv_bytes).decode()
+        stem       = filename.rsplit(".", 1)[0]
+        twin_fname = f"{stem}_codeastra_twins.csv"
+
+        send("result", {
+            "filename":      filename,
+            "real_auc":      round(auc_r, 4),
+            "twin_auc":      round(auc_t, 4),
+            "agreement":     round(agreement, 1),
+            "n_train":       len(X_tr),
+            "n_test":        len(X_te),
+            "twin_csv_b64":  csv_b64,
+            "twin_filename": twin_fname,
+        })
+
+    except Exception as e:
+        send("result", {"error": str(e)})
+    finally:
+        # Clean up job after a delay
+        await asyncio.sleep(300)
+        _jobs.pop(job_id, None)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def index():
-    return HTML
+    return HTMLResponse(HTML)
 
 
-@app.post("/benchmark")
-async def benchmark(
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/start")
+async def start(
     file:    UploadFile = File(...),
     api_key: str        = Form(...),
 ):
-    contents = await file.read()
-
-    # Validate API key format first — before any other check
+    """Upload file + key → returns job_id immediately."""
     key = api_key.strip()
     if not key or len(key) < 20:
-        raise HTTPException(401, "Invalid API key. Check your Codeastra API key.")
+        raise HTTPException(401, "Invalid API key.")
 
-    try:
-        df = read_file(contents, file.filename)
-    except Exception as e:
-        raise HTTPException(400, f"Cannot read file: {e}")
+    contents = await file.read()
+    job_id   = str(uuid.uuid4())
+    _jobs[job_id] = asyncio.Queue()
 
-    if len(df) < 50:
-        raise HTTPException(400, "Need at least 50 rows.")
-
-    try:
-        X, y, target, col_encoders = prepare(df)
-    except Exception as e:
-        raise HTTPException(400, f"Data preparation failed: {e}")
-
-    if X.shape[1] == 0:
-        raise HTTPException(400, "No numeric feature columns found.")
-
-    # Split — test set NEVER touches the API
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+    asyncio.create_task(
+        run_benchmark_job(job_id, contents, file.filename, key)
     )
+    return {"job_id": job_id}
 
-    # Twin training set
-    try:
-        X_tw = twin_df(X_tr, key)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Codeastra API error: {e}")
 
-    # Train
-    def model():
-        return Pipeline([
-            ("sc", StandardScaler()),
-            ("rf", RandomForestClassifier(
-                200, max_depth=8, min_samples_leaf=5,
-                random_state=RANDOM_STATE, n_jobs=-1
-            ))
-        ])
+@app.get("/stream/{job_id}")
+async def stream(job_id: str):
+    """SSE stream for a running benchmark job."""
+    if job_id not in _jobs:
+        raise HTTPException(404, "Job not found.")
 
-    mr = model(); mr.fit(X_tr, y_tr)
-    mt = model(); mt.fit(X_tw, y_tr)
+    q = _jobs[job_id]
 
-    pred_r = mr.predict(X_te)
-    pred_t = mt.predict(X_te)
-    auc_r  = roc_auc_score(y_te, mr.predict_proba(X_te)[:,1])
-    auc_t  = roc_auc_score(y_te, mt.predict_proba(X_te)[:,1])
+    async def event_generator():
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=120)
+                yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'])}\n\n"
+                if msg["event"] == "result":
+                    break
+            except asyncio.TimeoutError:
+                yield "event: ping\ndata: {}\n\n"
 
-    return {
-        "filename":  file.filename,
-        "target":    target,
-        "real_auc":  round(auc_r, 4),
-        "twin_auc":  round(auc_t, 4),
-        "agreement": round(float(np.mean(pred_r == pred_t)) * 100, 1),
-        "n_train":   len(X_tr),
-        "n_test":    len(X_te),
-    }
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("benchmark_app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
