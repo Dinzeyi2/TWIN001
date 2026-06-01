@@ -391,13 +391,21 @@ function hide(id) { document.getElementById(id).style.display = 'none'; }
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def read_file(contents: bytes, filename: str) -> pd.DataFrame:
-    if filename.endswith(".xls"):
-        return pd.read_excel(io.BytesIO(contents), engine="xlrd")
-    if filename.endswith(".xlsx"):
-        return pd.read_excel(io.BytesIO(contents), engine="openpyxl")
-    sample = contents[:4096].decode("utf-8", errors="ignore")
-    sep    = ";" if sample.count(";") > sample.count(",") else ","
-    return pd.read_csv(io.BytesIO(contents), sep=sep)
+    base = filename.split("/")[-1].split("\\")[-1]
+    if base.endswith(".xls"):
+        df = pd.read_excel(io.BytesIO(contents), engine="xlrd")
+    elif base.endswith(".xlsx"):
+        df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
+    else:
+        sample = contents[:4096].decode("utf-8", errors="ignore")
+        sep    = ";" if sample.count(";") > sample.count(",") else ","
+        df     = pd.read_csv(io.BytesIO(contents), sep=sep,
+                             skipinitialspace=True, na_values="?")
+        if all(isinstance(c, (int, float)) for c in df.columns):
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 def prepare(df: pd.DataFrame):
@@ -655,8 +663,8 @@ async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key
             "real_auc":      round(auc_r, 4),
             "twin_auc":      round(auc_t, 4),
             "agreement":     round(agreement, 1),
-            "n_train":       len(X_tr),
-            "n_test":        len(X_te),
+            "n_train":       len(X_tr_raw),
+            "n_test":        len(X_te_enc),
             "twin_csv_b64":  csv_b64,
             "twin_filename": twin_fname,
         })
