@@ -2,8 +2,11 @@
 Codeastra Decision Fidelity Benchmark
 Real-time streaming + twin data download
 """
-import asyncio, base64, io, json, math, os, time, uuid, warnings
+import asyncio, base64, io, json, logging, math, os, time, traceback, uuid, warnings
 from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("codeastra.benchmark")
 
 import numpy  as np
 import pandas as pd
@@ -654,7 +657,9 @@ async def run_benchmark_job(job_id: str, contents: bytes, filename: str, api_key
         })
 
     except Exception as e:
-        send("result", {"error": str(e)})
+        tb = traceback.format_exc()
+        log.error(f"benchmark_job {job_id} FAILED:\n{tb}")
+        send("result", {"error": str(e), "detail": tb[-500:]})
     finally:
         # Clean up job after a delay
         await asyncio.sleep(300)
